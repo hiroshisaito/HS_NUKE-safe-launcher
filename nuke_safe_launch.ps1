@@ -35,7 +35,12 @@
   It cleans the .nuke\uistate.ini under HOME / HOMEDRIVE+HOMEPATH / USERPROFILE
   (whichever exist) so it also works on machines where Nuke's HOME is set.
 #>
-[CmdletBinding()]
+# PositionalBinding = $false: without it a trailing unnamed argument binds to the
+# first free typed parameter instead of reaching $ExtraArgs. Measured 2026-09-29 -
+#   ... -Major 16 "C:/comp.nk"   bound the .nk to -Exe and refused to start
+#   ... -Exe <path> "C:/comp.nk" bound the .nk to -Major and died on the int cast,
+# and that second one is the pass-through example printed in BOTH READMEs.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Major = 0,                 # 15 / 16 / 17 ; ignored if -Exe is given
     [string]$Exe = '',               # explicit Nuke exe path (overrides -Major)
@@ -127,7 +132,7 @@ function Invoke-SanitizeUiState {
 # Warn (do not block) if a Nuke is already running - the cleanup would be undone when
 # it exits, so the user should close open Nuke instances first for it to stick.
 $runningNuke = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like 'Nuke*' })
-if ($runningNuke.Count -gt 0) {
+if (-not $ListVersions -and $runningNuke.Count -gt 0) {
     Write-Log ("NOTE: {0} Nuke process(es) already running - the uistate cleanup may be overwritten on their exit. Close all Nuke instances first for it to take effect." -f $runningNuke.Count)
 }
 
@@ -151,6 +156,12 @@ else {
         if (-not $seen.ContainsKey($key)) { $seen[$key] = $true; $targets += $p }
     }
 }
+# -ListVersions only answers "what is installed". Nothing about that question
+# justifies rewriting uistate.ini, leaving a .presanitize.bak, or exiting 2 on a
+# file that is too big - all of which this block would otherwise do before the
+# list is ever printed. Emptying $targets skips the sanitize AND the size gate.
+if ($ListVersions) { $targets = @() }
+
 $failedTargets = @()
 foreach ($t in $targets) {
     try {
@@ -232,9 +243,19 @@ function Set-PinnedVersion([int]$Major, [string]$Version) {
     $dir = Split-Path -Parent $path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $pinned = @{}
+    $other  = @{}
     if (Test-Path -LiteralPath $path) {
         try {
             $existing = (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | ConvertFrom-Json
+            if ($existing) {
+                # Carry over every top-level key except the one being rewritten.
+                # Only "pinned" exists today, but a newer launcher's setting must
+                # not be silently dropped just because an older copy of this
+                # script - off the share, say - saved a default over it.
+                $existing.PSObject.Properties | ForEach-Object {
+                    if ($_.Name -ne 'pinned') { $other[$_.Name] = $_.Value }
+                }
+            }
             if ($existing -and $existing.pinned) {
                 $existing.pinned.PSObject.Properties | ForEach-Object { $pinned[$_.Name] = $_.Value }
             }
@@ -246,12 +267,22 @@ function Set-PinnedVersion([int]$Major, [string]$Version) {
         }
     }
     $pinned["$Major"] = $Version
-    $json = ([pscustomobject]@{ pinned = [pscustomobject]$pinned } | ConvertTo-Json -Depth 5)
+    $other['pinned'] = [pscustomobject]$pinned
+    $json = ([pscustomobject]$other | ConvertTo-Json -Depth 5)
+    # Saving is a convenience; launching is the job. A read-only profile or a
+    # roaming-home hiccup must not leave the artist with no Nuke, so the write
+    # is allowed to fail loudly and the script carries on to the launch.
     # WriteAllText with an explicit no-BOM encoder: Set-Content -Encoding UTF8
     # writes a BOM on Windows PowerShell 5.1, and a BOM in a JSON file is
     # something a stricter reader (python's json.load, say) refuses outright.
-    [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Log "saved: Nuke $Major now launches $Version by default ($path)"
+    try {
+        [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Log "saved: Nuke $Major now launches $Version by default ($path)"
+    }
+    catch {
+        Write-Log "could not save the default to ${path}: $($_.Exception.Message)"
+        Write-Log "carrying on and launching anyway; the choice was not remembered."
+    }
 }
 
 # --------------------------------------------------------------------
@@ -299,35 +330,31 @@ function Get-NukeCandidates {
     #     Fine while the only question was "which one do we launch"; not fine now
     #     that the user picks. Both sources always run and are merged; the Start
     #     Menu still wins ties, so the default pick is unchanged.
-    if ($true) {
-        # -SearchRoot exists for the tests, the same way -UiStatePath does: a
-        # machine rarely has two real builds of one major, so the choice this
-        # feature is FOR cannot otherwise be exercised.
-        $bases = @()
-        if ($SearchRoot) {
-            $bases += $SearchRoot
-        }
-        else {
-            $fixed = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady }
-            foreach ($d in $fixed) {
-                foreach ($pf in @('Program Files', 'Program Files (x86)')) {
-                    $bases += (Join-Path $d.RootDirectory.FullName $pf)
-                }
+    # -SearchRoot exists for the tests, the same way -UiStatePath does: a machine
+    # rarely has two real builds of one major, so the choice this feature is FOR
+    # cannot otherwise be exercised.
+    $bases = @()
+    if ($SearchRoot) {
+        $bases += $SearchRoot
+    }
+    else {
+        $fixed = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady }
+        foreach ($d in $fixed) {
+            foreach ($pf in @('Program Files', 'Program Files (x86)')) {
+                $bases += (Join-Path $d.RootDirectory.FullName $pf)
             }
         }
-        foreach ($base in $bases) {
-            if ($true) {
-                if (Test-Path -LiteralPath $base) {
-                    Get-ChildItem -LiteralPath $base -Directory -Filter "Nuke$Major.*" -ErrorAction SilentlyContinue | ForEach-Object {
-                        $verFolder = $_.Name
-                        Get-ChildItem -LiteralPath $_.FullName -Filter "Nuke$Major.*.exe" -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -match "^Nuke$Major\.\d+\.exe$" } | ForEach-Object {
-                                $minor = 0; $build = 0
-                                if ($verFolder -match "^Nuke$Major\.(\d+)v(\d+)") { $minor = [int]$Matches[1]; $build = [int]$Matches[2] }
-                                $cands += [pscustomobject]@{ Path = $_.FullName; Minor = $minor; Build = $build; FromStartMenu = $false }
-                            }
+    }
+    foreach ($base in $bases) {
+        if (Test-Path -LiteralPath $base) {
+            Get-ChildItem -LiteralPath $base -Directory -Filter "Nuke$Major.*" -ErrorAction SilentlyContinue | ForEach-Object {
+                $verFolder = $_.Name
+                Get-ChildItem -LiteralPath $_.FullName -Filter "Nuke$Major.*.exe" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "^Nuke$Major\.\d+\.exe$" } | ForEach-Object {
+                        $minor = 0; $build = 0
+                        if ($verFolder -match "^Nuke$Major\.(\d+)v(\d+)") { $minor = [int]$Matches[1]; $build = [int]$Matches[2] }
+                        $cands += [pscustomobject]@{ Path = $_.FullName; Minor = $minor; Build = $build; FromStartMenu = $false }
                     }
-                }
             }
         }
     }
@@ -385,10 +412,20 @@ function Resolve-NukeExe {
             Write-Log ("using Nuke {0} (from {1})" -f $hit.Version, $wantedFrom)
             return $hit.Path
         }
-        # Not installed any more. Warn and take the newest rather than refusing
-        # to start: uninstalling an old build must not break the launcher.
+        $available = (($cands | ForEach-Object { $_.Version }) -join ', ')
+        if ($Version.Trim()) {
+            # Asked for on the command line. Refuse: starting a DIFFERENT build
+            # than the one named is the failure this feature exists to prevent,
+            # and a silent fallback exits 0 so the wrapper never pauses and
+            # nobody reads the warning. -SetDefault already refuses the same
+            # string; this makes the launch path agree with it.
+            throw ("Nuke {0} is not installed. Available: {1}" -f $wanted, $available)
+        }
+        # A SAVED pin, not a request made just now: warn and take the newest
+        # rather than refusing to start. Uninstalling an old build must not
+        # break the launcher for everyone who pinned it.
         Write-Log ("Nuke {0} ({1}) is not installed; available: {2}" -f `
-            $wanted, $wantedFrom, (($cands | ForEach-Object { $_.Version }) -join ', '))
+            $wanted, $wantedFrom, $available)
         Write-Log ("falling back to the newest, Nuke {0}" -f $cands[0].Version)
     }
 

@@ -64,9 +64,15 @@ The preference is stored per user and per machine in `~/.nuke/hs_nuke_launcher.j
 run off the share and would carry one machine's choice to every other. Remove the entry (or
 the file) to go back to "newest".
 
-Precedence, highest first: `-Exe` → `-Version` → the saved default → newest installed. If the
-saved build has since been uninstalled the launcher says so and starts the newest instead,
-rather than refusing to run. `-SetDefault` will not save a version that is not installed.
+Precedence, highest first: `-Exe` → `-Version` → the saved default → newest installed.
+
+The two "not installed" cases deliberately differ:
+
+- **A `-Version` you typed** that matches nothing is an error. The launcher lists what IS
+  installed and stops, because starting a different build than the one you named is the
+  problem this option exists to avoid. `-SetDefault` refuses the same string.
+- **A saved default** that has since been uninstalled only warns, and the newest starts
+  instead. Removing an old build must not stop everyone who pinned it from working.
 
 ## Files
 
@@ -83,14 +89,20 @@ Double-click the `.bat` for the version you want. The console window flashes (sh
 sanitize result) and NukeX opens. On error (e.g. that Nuke version not installed) the window
 stays open with the message.
 
+You can also drag a `.nk` onto the `.bat`, or pass one on the command line: anything not
+recognised as an option is handed straight to Nuke.
+
 ### Deploy to another machine
 
 Copy this whole `launchers` folder anywhere on the target machine (or run it straight from the
 network/repo). No editing needed:
 
 - The Nuke executable is resolved from the machine's **Start Menu shortcuts** (the Foundry
-  installer's canonical path), falling back to a scan of `Program Files` on every fixed drive.
-  A manually-cloned duplicate copy on another drive is therefore ignored.
+  installer's canonical path) **and** from `Program Files` on every fixed drive. Both are
+  always scanned and the results merged; the Start Menu wins ties, so the build that starts
+  by default is the one the installer registered. (Program Files used to be searched only
+  when the Start Menu found nothing, which hid any build without a shortcut - fine while the
+  only question was "which one do we launch", not fine once you can pick.)
 - The `uistate.ini` path follows `HOME`/`USERPROFILE`, so it also works where the studio sets
   `HOME`.
 
